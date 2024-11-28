@@ -1,0 +1,962 @@
+/* ==============================================================================================================
+ * Author: CXX
+ * Date: 2022-04-14
+ * Version:
+ * Copyright (C) CXX, All rights reserved
+ * Description:
+ * History:
+ * 20220414: C source file, be created
+ * ==============================================================================================================
+ */
+
+#include <stdio.h>
+#include <string.h>
+#include "classfile_util.h"
+#include "cf_bytecode.h"
+#include "cf_impl.h"
+
+
+CF_HIDDEN const juint8 CF_OPC_LEN[256] = CF_OPC_LEN_INITIALIZER;
+
+CF_HIDDEN const char CF_OPC_SYM[256][24] = CF_OPC_SYM_INITIALIZER;
+
+// keep the order as requirement of the opcode "newarray"
+CF_HIDDEN
+const juint8 CF_OPC_RETURN[16] = {
+		0, 0, 0,
+		CF_OPC_return,   /* void */
+		CF_OPC_ireturn,  /* boolean */
+		CF_OPC_ireturn,  /* char */
+		CF_OPC_freturn,  /* float */
+		CF_OPC_dreturn,  /* double */
+		CF_OPC_ireturn,  /* byte */
+		CF_OPC_ireturn,  /* short */
+		CF_OPC_ireturn,  /* int */
+		CF_OPC_lreturn,  /* long */
+		CF_OPC_areturn,  /* class */
+		CF_OPC_areturn,  /* array */
+		CF_OPC_areturn,  /* enum ? */
+		0
+};
+
+//
+CF_HIDDEN
+const juint8 CF_OPC_STORE[16] = {
+		0, 0, 0,
+		0,   /* void */
+		CF_OPC_istore,  /* boolean */
+		CF_OPC_istore,  /* char */
+		CF_OPC_fstore,  /* float */
+		CF_OPC_dstore,  /* double */
+		CF_OPC_istore,  /* byte */
+		CF_OPC_istore,  /* short */
+		CF_OPC_istore,  /* int */
+		CF_OPC_lstore,  /* long */
+		CF_OPC_astore,  /* class */
+		CF_OPC_astore,  /* array */
+		CF_OPC_astore,  /* enum ? */
+		0
+};
+
+
+
+
+// Function: locate all CONTROL instructions
+CF_InsLoc*  cf_locate_ctrl_instruction( const juint8 *code, int len, CF_InsLoc *loc_ptr, int *loc_len )
+{
+	register unsigned char c;
+	register int p, n, l;
+	int L, a0;
+
+	L = *loc_len & !loc_ptr - 1;
+	l = 0;
+	p = 0;
+	while( p < len )
+	{
+		if( (n = cf_opc_len_calcu( &code[p], p )) <= 0 )
+			return NULL;
+
+		c = code[p];
+		if( (c >= CF_OPC_CTRL_Begin && c <= CF_OPC_CTRL_End) ||
+			(c >= CF_OPC_CMP_Begin && c <= CF_OPC_CMP_End) ||
+			(c == CF_OPC_ifnull || c == CF_OPC_ifnonnull ||
+			 c == CF_OPC_goto_w || c == CF_OPC_jsr_w)
+			)
+		{
+			// Control Instructions
+			if( l >= L )
+			{
+				// re-allocate
+				L += 32;
+				void *ptr = realloc( loc_ptr, sizeof(CF_InsLoc) * L );
+				if( !ptr )
+					return NULL;
+				loc_ptr = ptr;
+			}
+
+			loc_ptr[l].opc = c;
+			loc_ptr[l].pos = p;
+			loc_ptr[l].len = n;
+			loc_ptr[l].ext = 0;
+			loc_ptr[l].add = 0;
+			loc_ptr[l].same = 0;
+
+			// calculate the "jmpto", as a absolute position
+			switch( c )
+			{
+			case CF_OPC_tableswitch:{
+				// choose the maximum offset
+		    	a0 = (p + 4) & -4;  // (p + 1 + 3) & -4;
+		    	int _m = 1 + _MAKE_INT32_( code[a0+8], code[a0+9], code[a0+10], code[a0+11] )
+		    			   - _MAKE_INT32_( code[a0+4], code[a0+5], code[a0+6], code[a0+7] );
+		    	if( l+_m+1 > L )
+				{
+					// re-allocate
+					L += _m+1;
+					void *ptr = realloc( loc_ptr, sizeof(CF_InsLoc) * L );
+					if( !ptr )
+						return NULL;
+					loc_ptr = ptr;
+				}
+
+		    	int _d = l;
+		    	loc_ptr[l].jmpto = p + _MAKE_INT32_( code[a0], code[a0+1], code[a0+2], code[a0+3] );  // default is the first
+		    	loc_ptr[l].same = 1;
+
+		    	for( a0+=12; --_m >= 0; a0+=4 )
+		    	{
+		    		loc_ptr[++l] = loc_ptr[_d];
+		    		loc_ptr[l].jmpto = p + _MAKE_INT32_( code[a0], code[a0+1], code[a0+2], code[a0+3] );
+		    	}
+		    	loc_ptr[_d].same = 0;
+		    	break;
+		    }
+			case CF_OPC_lookupswitch:{
+				// choose the maximum offset
+		    	a0 = (p + 4) & -4;  // (p + 1 + 3) & -4;
+		    	int _m = _MAKE_INT32_( code[a0+4], code[a0+5], code[a0+6], code[a0+7] );
+		    	if( l+_m+1 > L )
+				{
+					// re-allocate
+					L += _m+1;
+					void *ptr = realloc( loc_ptr, sizeof(CF_InsLoc) * L );
+					if( !ptr )
+						return NULL;
+					loc_ptr = ptr;
+				}
+
+		    	int _d = l;
+		    	loc_ptr[l].jmpto = p + _MAKE_INT32_( code[a0], code[a0+1], code[a0+2], code[a0+3] );  // default is the first
+		    	loc_ptr[l].same = 1;
+
+		    	for( a0+=8; --_m >= 0; a0+=8 )
+		    	{
+		    		loc_ptr[++l] = loc_ptr[_d];
+		    		loc_ptr[l].jmpto = p + _MAKE_INT32_( code[a0+4], code[a0+5], code[a0+6], code[a0+7] );
+		    	}
+		    	loc_ptr[_d].same = 0;
+		    	break;
+		    }
+			case CF_OPC_goto_w:
+			case CF_OPC_jsr_w:
+				loc_ptr[l].jmpto = p + _MAKE_INT32_( code[p+1], code[p+2], code[p+3], code[p+4] );
+				break;
+			case CF_OPC_goto:
+			case CF_OPC_jsr:
+			case CF_OPC_lcmp:
+			case CF_OPC_fcmpl:
+			case CF_OPC_fcmpg:
+			case CF_OPC_dcmpl:
+			case CF_OPC_dcmpg:
+			case CF_OPC_ifeq:
+			case CF_OPC_ifne:
+			case CF_OPC_iflt:
+			case CF_OPC_ifge:
+			case CF_OPC_ifgt:
+			case CF_OPC_ifle:
+			case CF_OPC_if_icmpeq:
+			case CF_OPC_if_icmpne:
+			case CF_OPC_if_icmplt:
+			case CF_OPC_if_icmpge:
+			case CF_OPC_if_icmpgt:
+			case CF_OPC_if_icmple:
+			case CF_OPC_if_acmpeq:
+			case CF_OPC_if_acmpne:
+			case CF_OPC_ifnull:
+			case CF_OPC_ifnonnull:
+				a0 = _MAKE_INT16_( code[p+1], code[p+2] );
+				loc_ptr[l].jmpto = p + (-(a0>>15)&0xffff0000|a0);
+				break;
+			case CF_OPC_ret:
+			case CF_OPC_ireturn:
+			case CF_OPC_lreturn:
+			case CF_OPC_freturn:
+			case CF_OPC_dreturn:
+			case CF_OPC_areturn:
+			case CF_OPC_return:
+			default:
+				loc_ptr[l].jmpto = 0;
+				break;
+			}
+
+			l++;
+		}
+		p += n;
+	}
+
+	*loc_len = l;
+	return loc_ptr;
+}
+
+
+// Function: alter offset as which operand of CONTROL instructions,
+//           and alter exception table belongs to attribute "Code" of method
+int cf_alter_instruction_offset( CF_InsLoc *locs, int num, int beg_pos, CF_ExpOff *exptab, int expnum )
+{
+	// Note: Assumes that "locs" has been setup by cf_locate_ctrl_instruction
+	//       Exit Code stays at the head
+
+	register int i, k, p;
+	register char d;
+	int n;
+
+
+	for( n=i=0; i < num; i++ )
+	{
+		// seek instruction "return or [x]return"
+		if( locs[i].opc >= CF_OPC_ireturn && locs[i].opc <= CF_OPC_return )
+		{
+			// "return" will be replaced by "goto_w"
+			locs[i].add = 4; // 2 << ((locs[i].pos+n) > 0x0FFFF)
+			n += 4;
+
+			p = locs[i].pos;
+
+			// try to alter all related offset
+			for( k=0; k < num; k++ )
+			{
+				if( p < locs[k].jmpto && p > locs[k].pos )
+					locs[k].ext += 4;  // "jmpto" is a absolute position, means instruction position plus it's offset
+			}
+
+			// try to adjust exception block
+			for( k=0; k < expnum; k++ )
+			{
+				if( p < exptab[k].start_pc ) {
+					exptab[k].start_off += 4;
+					exptab[k].end_off += 4;
+					exptab[k].handler_off += 4;
+				}
+				else if( p < exptab[k].end_pc ) {  // exclude return instruction
+					exptab[k].end_off += 4;
+					exptab[k].handler_off += 4;
+				}
+				else if( p < exptab[k].handler_pc )
+					exptab[k].handler_off += 4;
+			}
+		}
+		else if( locs[i].opc == CF_OPC_tableswitch || locs[i].opc == CF_OPC_lookupswitch )
+		{
+			p = locs[i].pos;
+			d = ((p&3) - (p+beg_pos+n&3));  // equal to (4-((A'+1)%4)) - (4-((A+1)%4))
+			if( d )
+			{
+				n += d;
+
+				// try to alter all related offset
+				for( k=0; k < num; k++ )
+				{
+					if( p < locs[k].jmpto && p >= locs[k].pos )  // include self
+						locs[k].ext += d;  // "jmpto" is a absolute position, means instruction position plus it's offset
+				}
+
+				// try to adjust exception block
+				for( k=0; k < expnum; k++ )
+				{
+					if( p < exptab[k].start_pc ) {
+						exptab[k].start_off += d;
+						exptab[k].end_off += d;
+						exptab[k].handler_off += d;
+					}
+					else if( p < exptab[k].end_pc ) {  // exclude switch instruction
+						exptab[k].end_off += d;
+						exptab[k].handler_off += d;
+					}
+					else if( p < exptab[k].handler_pc )
+						exptab[k].handler_off += d;
+				}
+			}
+		}
+	}
+
+	return n;
+}
+
+
+// Function: re-assemble instruction sequences according to altered locations
+int cf_assemble_instruction( const juint8 *src, int srclen,
+							 juint8 *dst, int dstsize,
+							 CF_InsLoc *locs, int nlocs,
+							 int dst_pos, int exit_pos
+							 )
+{
+	int i, _p, p, n, l;
+	juint8 c;
+
+	i = p = 0;
+	l = dst_pos;
+
+	while( p < srclen && l < dstsize )
+	{
+		if( i >= nlocs )
+		{
+			// the last block
+			n = srclen - p;
+			memcpy( &dst[l], &src[p], n );
+			l += n;
+			break;
+		}
+
+		// block between CONTROLs
+
+		_p = locs[i].pos;
+		n = _p - p;
+		memcpy( &dst[l], &src[p], n );
+		l += n;
+
+		if( locs[i].add == 4 )
+		{
+			// return => goto_w
+			n = exit_pos - l;
+			dst[l++] = CF_OPC_goto_w;
+			dst[l++] = n >> 24;
+			dst[l++] = (n >> 16) & 0xFF;
+			dst[l++] = (n >> 8) & 0xFF;
+			dst[l++] = n & 0xFF;
+		}
+		else
+		{
+			// CONTROL instructions
+			c = locs[i].opc;
+
+			if( locs[i].ext || c == CF_OPC_tableswitch || c == CF_OPC_lookupswitch )
+			{
+				dst[l++] = c;
+
+				// alter offset
+				switch( c )
+				{
+				case CF_OPC_tableswitch:{
+					int a = (_p + 4) & -4;
+					int m = 1 + _MAKE_INT32_( src[a+8], src[a+9], src[a+10], src[a+11] )
+							  - _MAKE_INT32_( src[a+4], src[a+5], src[a+6], src[a+7] );
+
+					//
+					l = ((l + 3) & -4);
+					memcpy( &dst[l], &src[a], 12 + m * 4 );
+
+					if( locs[i].ext )
+					{
+						// first item is the default
+						n = locs[i].ext + _MAKE_INT32_( src[a], src[a+1], src[a+2], src[a+3] );
+						dst[l] = n >> 24;
+						dst[l+1] = (n >> 16) & 0xFF;
+						dst[l+2] = (n >> 8) & 0xFF;
+						dst[l+3] = n & 0xFF;
+					}
+
+					l += 12;
+					for( a+=12; --m >= 0; a+=4 )
+					{
+						if( locs[++i].ext )
+						{
+							n = locs[i].ext + _MAKE_INT32_( src[a], src[a+1], src[a+2], src[a+3] );
+							dst[l] = n >> 24;
+							dst[l+1] = (n >> 16) & 0xFF;
+							dst[l+2] = (n >> 8) & 0xFF;
+							dst[l+3] = n & 0xFF;
+						}
+						l += 4;
+					}
+					break;
+				}
+				case CF_OPC_lookupswitch:{
+					int a = (_p + 4) & -4;
+					int m = _MAKE_INT32_( src[a+4], src[a+5], src[a+6], src[a+7] );
+
+					//
+					l = ((l + 3) & -4);
+					memcpy( &dst[l], &src[a], 8 + m * 8 );
+
+					if( locs[i].ext )
+					{
+						// first item is the default
+						n = locs[i].ext + _MAKE_INT32_( src[a], src[a+1], src[a+2], src[a+3] );
+						dst[l] = n >> 24;
+						dst[l+1] = (n >> 16) & 0xFF;
+						dst[l+2] = (n >> 8) & 0xFF;
+						dst[l+3] = n & 0xFF;
+					}
+
+					l += 8;
+					for( a+=8; --m >= 0; a+=8 )
+					{
+						if( locs[++i].ext )
+						{
+							n = locs[i].ext + _MAKE_INT32_( src[a+4], src[a+5], src[a+6], src[a+7] );
+							dst[l+4] = n >> 24;
+							dst[l+5] = (n >> 16) & 0xFF;
+							dst[l+6] = (n >> 8) & 0xFF;
+							dst[l+7] = n & 0xFF;
+						}
+						l += 8;
+					}
+					break;
+				}
+				case CF_OPC_goto_w:
+				case CF_OPC_jsr_w:
+					n = locs[i].ext + _MAKE_INT32_( src[_p+1], src[_p+2], src[_p+3], src[_p+4] );
+					dst[l++] = n >> 24;
+					dst[l++] = (n >> 16) & 0xFF;
+					dst[l++] = (n >> 8) & 0xFF;
+					dst[l++] = n & 0xFF;
+					break;
+				case CF_OPC_goto:
+				case CF_OPC_jsr:
+				case CF_OPC_lcmp:
+				case CF_OPC_fcmpl:
+				case CF_OPC_fcmpg:
+				case CF_OPC_dcmpl:
+				case CF_OPC_dcmpg:
+				case CF_OPC_ifeq:
+				case CF_OPC_ifne:
+				case CF_OPC_iflt:
+				case CF_OPC_ifge:
+				case CF_OPC_ifgt:
+				case CF_OPC_ifle:
+				case CF_OPC_if_icmpeq:
+				case CF_OPC_if_icmpne:
+				case CF_OPC_if_icmplt:
+				case CF_OPC_if_icmpge:
+				case CF_OPC_if_icmpgt:
+				case CF_OPC_if_icmple:
+				case CF_OPC_if_acmpeq:
+				case CF_OPC_if_acmpne:
+				case CF_OPC_ifnull:
+				case CF_OPC_ifnonnull:
+					n = locs[i].ext + _MAKE_INT16_( src[_p+1], src[_p+2] );
+					dst[l++] = (n >> 8) & 0xFF;
+					dst[l++] = n & 0xFF;
+					break;
+				default:
+					return -1;
+				}
+			}
+			else
+			{
+				// keep unmodified
+				memcpy( &dst[l], &src[_p], locs[i].len );
+				l += locs[i].len;
+			}
+		}
+
+		p = _p + locs[i++].len;
+	}
+
+	return l;
+}
+
+
+// Function: modify constant pool index used by specific opcode
+void cf_modify_cp_index( juint8 *code, int len, int cp_off )
+{
+	register int p, n, i;
+
+	p = 0;
+	while( p < len )
+	{
+		if( (n = cf_opc_len_calcu( &code[p], p )) <= 0 )
+			break;
+
+		switch( code[p] )
+		{
+	    case CF_OPC_ldc             : /* it's impossible to appears in byte-code which is compatible with SABI */
+	    	i = code[p+1];
+	    	code[p+1] = (cp_off + i) & -!!i;
+	    	break;
+	    case CF_OPC_ldc_w           :
+	    case CF_OPC_ldc2_w          :
+	    case CF_OPC_getstatic       :
+	    case CF_OPC_putstatic       :
+	    case CF_OPC_getfield        :
+	    case CF_OPC_putfield        :
+	    case CF_OPC_invokevirtual   :
+	    case CF_OPC_invokespecial   :
+	    case CF_OPC_invokestatic    :
+	    case CF_OPC_invokeinterface :
+	    case CF_OPC_invokedynamic   :
+	    case CF_OPC_new             :
+	    case CF_OPC_anewarray       :
+	    case CF_OPC_checkcast       :
+	    case CF_OPC_instanceof      :
+	    case CF_OPC_multianewarray  :
+	    	i = _MAKE_INT16_( code[p+1], code[p+2] );
+	    	i = (cp_off + i) & -!!i;
+	    	code[p+1] = (i>>8)&0xff;
+	    	code[p+2] = i&0xff;
+	    	break;
+	    //default:
+		}
+		p += n;
+	}
+}
+
+
+// Function: seek local variables in byte code
+int cf_seek_local_var( const juint8 *code, int len, cf_idx_t *rdvar, cf_idx_t *wrvar, int varmax  )
+{
+	register int p, n;
+	register juint8 c, w;
+	int r = 0;
+
+	p = 0;
+	while( p < len && r < varmax )
+	{
+		if( (n = cf_opc_len_calcu( &code[p], p )) <= 0 )
+			break;
+
+		c = code[p];
+		if( (w = c==CF_OPC_wide) )
+		{
+			c = code[++p];
+			n--;
+		}
+
+		if( rdvar )
+		{
+			if( c >= CF_OPC_iload_0 && c <= CF_OPC_aload_3 )
+				rdvar[r++] = (c - CF_OPC_iload_0) & 3;
+			else if( c >= CF_OPC_iload && c <= CF_OPC_aload )
+				rdvar[r++] = w ? _MAKE_INT16_( code[p+1], code[p+2] ) : code[p+1];
+		}
+
+		if( wrvar )
+		{
+			if( c >= CF_OPC_istore_0 && c <= CF_OPC_astore_3 )
+				wrvar[r++] = (c - CF_OPC_istore_0) & 3;
+			else if( c >= CF_OPC_istore && c <= CF_OPC_astore )
+				wrvar[r++] = w ? _MAKE_INT16_( code[p+1], code[p+2] ) : code[p+1];
+		}
+
+		p += n;
+	}
+	return r;
+}
+
+
+// Function: blend source code and stub code as one integrated sequences
+// Arguments:
+// src_buf: [0]=source byte-code;
+//			[1]=Entry-Code going to be inserted;
+//			[2]=Exit-Code going to be inserted;
+//			[3]=Try-Catch-Code going to be inserted
+//			[4]=Head-Code at which prior to the Entry-Code
+// src_len: [x] is a length of src_buf[x]
+// dst_buf: destination buffer
+// dst_sz : original buffer size of the dst_buf
+// exp_tab: exception table
+// exp_num: number of try-catch entries
+// info   : return some important information about transforming
+// Return: number of bytes lived in the destination if succeed, otherwise -1 will be returned
+// Note:
+// 1, Verification is prohibited due to performance requirement
+// 2, Regardless of existence of any constants
+
+int cf_bytecode_transform( const juint8 *src_buf[],
+						   const int    *src_len,
+						   juint8      **dst_buf,
+						   int           dst_sz,
+						   CF_ExpInfo   *exp_tab,
+						   int           exp_num,
+						   int           cp_off,
+						   const char   *mtd_desc,
+						   CF_CodeTransformInfo *info
+						   )
+{
+	const juint8 *src_ptr = src_buf[0];
+	const juint8 *entry_ptr = src_buf[1];
+	const juint8 *exit_ptr = src_buf[2];
+	const juint8 *catch_ptr = src_buf[3];
+	const juint8 *head_ptr = src_buf[4];
+	int srclen = src_len[0];
+	int entry_len = src_len[1];
+	int exit_len = src_len[2];
+	int catch_len = src_len[3];
+	int head_len = src_len[4];
+	juint8 *dst_ptr = *dst_buf;
+	CF_InsLoc *insLoc = NULL;
+	CF_ExpOff *expoff = NULL;
+	CF_CodeTransformInfo info2 = {0};
+	int insLocNum;
+	int ln, k;
+
+
+
+	// locate all CONTROL instructions
+	insLoc = cf_locate_ctrl_instruction( src_ptr, srclen, NULL, &insLocNum );
+	if( insLoc == NULL )
+		return -1;
+
+	if( exp_tab && exp_num > 0 )
+	{
+		expoff = malloc( (k=sizeof(CF_ExpOff) * exp_num) );
+		if( !expoff )
+			return -1;
+
+		memset( expoff, 0, k );
+		for( k=0; k < exp_num; k++ )
+		{
+			expoff[k].start_pc = _CF_ENDIAN_FLIP_U2( exp_tab[k].start_pc );
+			expoff[k].end_pc = _CF_ENDIAN_FLIP_U2( exp_tab[k].end_pc );
+			expoff[k].handler_pc = _CF_ENDIAN_FLIP_U2( exp_tab[k].handler_pc );
+		}
+	}
+
+	// calculate maximum length possible
+	ln = srclen + entry_len + exit_len + catch_len + insLocNum * 4 + 32;
+
+	if( dst_sz < ln )
+	{
+		dst_sz = _ALIGN_SIZE_( ln, 1024 );
+		dst_ptr = realloc( dst_ptr, dst_sz );
+		if( !dst_ptr )
+		{
+			if( expoff )
+				free( expoff );
+			return -1;
+		}
+	}
+
+	//
+	ln = 0;
+	if( exit_ptr && exit_len > 0 )
+	{
+		juint8 x, s;
+		cf_get_return_type( mtd_desc, &x );
+
+		k = 3 + !!(s=CF_SIGNATURE_SLOTS[x]);
+
+		if( s )
+		{
+			// insert an opcode "dup" or "dup2"
+			dst_ptr[3] = CF_OPC_dup + (3 & 1-s);  // s == 2 ? CF_OPC_dup2 : CF_OPC_dup;
+
+			// seek the local variable going to be returned
+			cf_idx_t retvar = -1;
+			cf_seek_local_var( head_ptr, head_len, NULL, &retvar, 1  );
+			if( retvar != -1 )
+			{
+				// insert an opcode "store"
+				if( retvar < 4 )
+				{
+					// <x>store_<n>
+					dst_ptr[4] = (juint8)(CF_OPC_istore_0 + (CF_OPC_STORE[x] - CF_OPC_istore) * 4 + retvar);
+					k++;
+				}
+				else if( retvar < 256 )
+				{
+					// <x>store index
+					dst_ptr[4] = CF_OPC_STORE[x];
+					dst_ptr[5] = retvar;
+					k += 2;
+				}
+				else
+				{
+					// wide <x>store index-high index-low
+					dst_ptr[4] = CF_OPC_wide;
+					dst_ptr[5] = CF_OPC_STORE[x];
+					dst_ptr[6] = retvar>>8;
+					dst_ptr[7] = retvar&0xff;
+					k += 4;
+				}
+			}
+		}
+
+		// length before the ENTRY
+		ln = k + exit_len + 1; // 1: [x]return
+
+		// instruction: goto ENTRY
+		dst_ptr[0] = CF_OPC_goto;
+		dst_ptr[1] = (ln>>8)&0xff;
+		dst_ptr[2] = ln&0xff;
+
+		// copy EXIT
+		memcpy( &dst_ptr[k], exit_ptr, exit_len );
+
+		// modify constant pool index used by EXIT
+		cf_modify_cp_index( &dst_ptr[k], exit_len, cp_off );
+
+		// append opcode "return"
+		dst_ptr[ln-1] = CF_OPC_RETURN[x];
+
+		info2.exit_pc = 3; // record the pc of EXIT
+	}
+
+	info2.enter_pc = ln; // record the pc of ENTRY
+
+	// copy ENTRY
+	memcpy( &dst_ptr[ln], entry_ptr, entry_len );
+
+	// modify constant pool index used by ENTRY
+	cf_modify_cp_index( &dst_ptr[ln], entry_len, cp_off );
+
+	ln += entry_len;
+
+	info2.code_pc = ln; // record the pc of ORGINAL byte-code
+
+	// alter instructions offset and modify the exception table if possible
+	cf_alter_instruction_offset( insLoc, insLocNum, info2.code_pc, expoff, exp_num );
+
+	// transform original instructions
+	ln = cf_assemble_instruction( src_ptr, srclen, dst_ptr, dst_sz, insLoc, insLocNum, info2.code_pc, 3 );
+	if( ln > 0 )
+	{
+		info2.code_ln = ln - info2.code_pc; // record the length of TRANSFORMED byte-code
+
+		//info2.last_opc = ln; // record the pc of the TERMINAL opcode; this location will be filled with a NOP instruction if possible
+
+		if( catch_ptr && catch_len > 0 )
+		{
+			// insert a NOP before the handler of try-catch
+			dst_ptr[ln++] = CF_OPC_nop;
+			info2.catch_pc = ln; // record the pc of CATCH
+
+			// copy CATCH
+			memcpy( &dst_ptr[ln], catch_ptr, catch_len );
+
+			// modify constant pool index used by ENTRY
+			cf_modify_cp_index( &dst_ptr[ln], catch_len, cp_off );
+
+			ln += catch_len;
+		}
+
+		if( expoff )
+		{
+			// alter exception table
+			int pc;
+			for( k=0; k < exp_num; k++ )
+			{
+				pc = expoff[k].start_pc + expoff[k].start_off + info2.code_pc;
+				exp_tab[k].start_pc = _CF_ENDIAN_FLIP_U2( pc );
+
+				pc = expoff[k].end_pc + expoff[k].end_off + info2.code_pc;
+				exp_tab[k].end_pc = _CF_ENDIAN_FLIP_U2( pc );
+
+				pc = expoff[k].handler_pc + expoff[k].handler_off + info2.code_pc;
+				exp_tab[k].handler_pc = _CF_ENDIAN_FLIP_U2( pc );
+			}
+		}
+
+		*dst_buf = dst_ptr;
+
+		if( info )
+			*info = info2;
+	}
+	else
+	{
+		// failed
+		if( *dst_buf == NULL )
+			free( dst_ptr );  // free destination buffer if it was allocated at the beginning
+	}
+
+	if( insLoc )
+		free( insLoc );
+	if( expoff )
+		free( expoff );
+
+	return ln;
+}
+
+
+//
+typedef int (*FUNPTR_INSTRUCTION_EXPLAIN)( const juint8 *code, int pos, const CF_ClassFileMap *cfmap, FILE *fout );
+
+//
+CF_UNUSED static  FUNPTR_INSTRUCTION_EXPLAIN cf_func_instruction_explain[256] = {
+		NULL
+};
+
+
+// Function: translate byte-code in readable instruction assemble sequences
+void cf_bytecode_translate( const juint8 *code, int len, const CF_ClassFileMap *cfmap, FILE *fout )
+{
+	register int n, p, c, a0;
+	CP_Info **cps = cfmap->cptab[0].cps;
+
+	p = 0;
+	while( p < len )
+	{
+		if( (n = cf_opc_len_calcu( &code[p], p )) <= 0 )
+			return ;
+
+		c = code[p];
+		fprintf( fout, "%5d: %-16.16s", p, CF_OPC_SYM[c] );
+
+		switch( c )
+		{
+		/* Constants */
+	    case CF_OPC_bipush     :
+	    	a0 = code[p+1];
+	    	fprintf( fout, " %02x%15c// %d", a0, 32, (-(a0>>7)&0xffffff00|a0) );
+	    	break;
+	    case CF_OPC_sipush     :
+	    	a0 = _MAKE_INT16_( code[p+1], code[p+2] );
+	    	fprintf( fout, " %04x%13c// %d", a0, 32, (-(a0>>15)&0xffff0000|a0) );
+	    	break;
+	    case CF_OPC_ldc        :
+	    	a0 = code[p+1];
+	    	fprintf( fout, " #%-16d// ", a0 );
+	    	cf_print_cpinfo( cps[a0], TRUE, fout );
+	    	break;
+	    case CF_OPC_ldc_w      :
+	    case CF_OPC_ldc2_w     :
+	    	a0 = _MAKE_INT16_( code[p+1], code[p+2] );
+	    	fprintf( fout, " #%-16d// ", a0 );
+	    	cf_print_cpinfo( cps[a0], TRUE, fout );
+	    	break;
+		/* Loads */
+	    case CF_OPC_iload      :
+	    case CF_OPC_lload      :
+	    case CF_OPC_fload      :
+	    case CF_OPC_dload      :
+	    case CF_OPC_aload      :
+		/* Stores */
+	    case CF_OPC_istore     :
+	    case CF_OPC_lstore     :
+	    case CF_OPC_fstore     :
+	    case CF_OPC_dstore     :
+	    case CF_OPC_astore     :
+			fprintf( fout, " [%d]", code[p+1] );
+			break;
+		/* Math */
+	    case CF_OPC_iinc       :
+	    	a0 = code[p+2];
+			fprintf( fout, " [%d], %d", code[p+1], (-(a0>>7)&0xffffff00|a0) );
+			break;
+		/* Comparisons */
+	    case CF_OPC_ifeq       :
+	    case CF_OPC_ifne       :
+	    case CF_OPC_iflt       :
+	    case CF_OPC_ifge       :
+	    case CF_OPC_ifgt       :
+	    case CF_OPC_ifle       :
+	    case CF_OPC_if_icmpeq  :
+	    case CF_OPC_if_icmpne  :
+	    case CF_OPC_if_icmplt  :
+	    case CF_OPC_if_icmpge  :
+	    case CF_OPC_if_icmpgt  :
+	    case CF_OPC_if_icmple  :
+	    case CF_OPC_if_acmpeq  :
+	    case CF_OPC_if_acmpne  :
+	    case CF_OPC_ifnull     :  /* Extended */
+	    case CF_OPC_ifnonnull  :  /* Extended */
+	    	a0 = _MAKE_INT16_( code[p+1], code[p+2] );
+	    	a0 = -(a0>>15)&0xffff0000|a0;
+	    	fprintf( fout, " %-16d // %d", a0, p+a0 );
+	    	break;
+		/* Controls */
+	    case CF_OPC_goto           :
+	    case CF_OPC_jsr            :
+	    	a0 = _MAKE_INT16_( code[p+1], code[p+2] );
+	    	a0 = -(a0>>15)&0xffff0000|a0;
+	    	fprintf( fout, " %-16d // %d", a0, p+a0 );
+	    	break;
+	    case CF_OPC_ret            :
+			fprintf( fout, " [%d]", code[p+1] );
+			break;
+	    case CF_OPC_tableswitch    :{
+	    	a0 = (p + 4) & -4;  // (p + 1 + 3) & -4;
+	    	int d = _MAKE_INT32_( code[a0], code[a0+1], code[a0+2], code[a0+3] );
+	    	int l = _MAKE_INT32_( code[a0+4], code[a0+5], code[a0+6], code[a0+7] );
+	    	int h = _MAKE_INT32_( code[a0+8], code[a0+9], code[a0+10], code[a0+11] );
+	    	fprintf( fout, " {  // low=%d, high=%d\n", l, h );
+	    	for( a0+=12; l <= h; l++, a0+=4 )
+	    		fprintf( fout, "%20d: %d\n", l, p+_MAKE_INT32_( code[a0], code[a0+1], code[a0+2], code[a0+3] ) );
+	    	fprintf( fout, "%20s: %d\n%12c}", "default", p+d, 32 );
+	    	break;
+	    }
+	    case CF_OPC_lookupswitch   :{
+	    	a0 = (p + 4) & -4;  // (p + 1 + 3) & -4;
+	    	int d = _MAKE_INT32_( code[a0], code[a0+1], code[a0+2], code[a0+3] );
+	    	int m = _MAKE_INT32_( code[a0+4], code[a0+5], code[a0+6], code[a0+7] );
+
+	    	fprintf( fout, " {  // npairs=%d\n", m );
+	    	for( a0+=8; --m >= 0; a0+=8 )
+	    		fprintf( fout, "%20d: %d\n",
+	    				_MAKE_INT32_( code[a0], code[a0+1], code[a0+2], code[a0+3] ),
+						p+_MAKE_INT32_( code[a0+4], code[a0+5], code[a0+6], code[a0+7] ) );
+	    	fprintf( fout, "%20s: %d\n%12c}", "default", p+d, 32 );
+	    	break;
+	    }
+		/* References */
+	    case CF_OPC_getstatic      :
+	    case CF_OPC_putstatic      :
+	    case CF_OPC_getfield       :
+	    case CF_OPC_putfield       :
+	    case CF_OPC_invokevirtual  :
+	    case CF_OPC_invokespecial  :
+	    case CF_OPC_invokestatic   :
+	    	a0 = _MAKE_INT16_( code[p+1], code[p+2] );
+	    	fprintf( fout, " #%-16d// ", a0 );
+	    	cf_print_cpinfo( cps[a0], TRUE, fout );
+	    	break;
+	    case CF_OPC_invokeinterface:
+	    	a0 = _MAKE_INT16_( code[p+1], code[p+2] );
+	    	fprintf( fout, " #%-16d, %d// ", a0, code[p+3] );
+	    	cf_print_cpinfo( cps[a0], TRUE, fout );
+	    	break;
+	    case CF_OPC_invokedynamic  :
+	    	a0 = _MAKE_INT16_( code[p+1], code[p+2] );
+	    	fprintf( fout, " #%-16d// ", a0 );
+	    	cf_print_cpinfo( cps[a0], TRUE, fout );
+	    	break;
+	    case CF_OPC_new            :
+	    case CF_OPC_anewarray      :
+	    case CF_OPC_checkcast      :
+	    case CF_OPC_instanceof     :
+	    	a0 = _MAKE_INT16_( code[p+1], code[p+2] );
+	    	fprintf( fout, " #%-16d// ", a0 );
+	    	cf_print_cpinfo( cps[a0], TRUE, fout );
+	    	break;
+	    case CF_OPC_newarray       :
+	    	fprintf( fout, " %s", CF_PRIME_TYPE_NAME[code[p+1]] );
+	    	break;
+		/* Extended */
+	    case CF_OPC_wide           :
+	    	if( code[p+1] == CF_OPC_iinc )
+	    	{
+	    		a0 = _MAKE_INT16_( code[p+4], code[p+5] );
+				fprintf( fout, "%s [%d], %d", CF_OPC_SYM[CF_OPC_iinc], _MAKE_INT16_( code[p+2], code[p+3] ), (-(a0>>15)&0xffff0000|a0) );
+	    	}
+	    	else if( code[p+1] == CF_OPC_ret )
+	    		fprintf( fout, "%s %d", CF_OPC_SYM[CF_OPC_ret], _MAKE_INT16_( code[p+2], code[p+3] ) );
+	    	else
+				fprintf( fout, "%s #%d", CF_OPC_SYM[code[p+1]], _MAKE_INT16_( code[p+2], code[p+3] ) );
+	    	break;
+	    case CF_OPC_multianewarray :
+	    	a0 = _MAKE_INT16_( code[p+1], code[p+2] );
+	    	fprintf( fout, " #%-16d, %d// ", a0, code[p+3] );
+	    	cf_print_cpinfo( cps[a0], TRUE, fout );
+	    	break;
+	    case CF_OPC_goto_w         :  /* also is Control */
+	    case CF_OPC_jsr_w          :  /* also is Control */
+	    	a0 = _MAKE_INT32_( code[p+1], code[p+2], code[p+3], code[p+4] );
+	    	fprintf( fout, " %-16d // %d", a0, p+a0 );
+	    	break;
+	    default:
+	    	break;
+		}
+		fprintf( fout, "\n" );
+		p += n;
+	}
+}

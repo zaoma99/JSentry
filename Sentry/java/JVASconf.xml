@@ -1,0 +1,108 @@
+<?xml version="1.0" encoding="utf-8"?>
+
+<JVAS>
+
+	<!-- Base Information -->
+	<NAME>jvas</NAME>
+	<VER>1.0.0</VER>
+	<LIB>Sentry</LIB>
+	<DESC></DESC>
+
+	<!-- Java Version Requirement -->
+  <JAVA-VERSION>
+		<JVM>1.8</JVM>
+		<JNI></JNI>
+		<JTI></JTI>
+		<VENDOR></VENDOR>
+	</JAVA-VERSION>
+
+	<!-- About Sentry ABI Specification -->
+	<SABI>
+		<VER>1.0.0</VER>
+		<FUNC-LIST>
+		</FUNC-LIST>
+	</SABI>
+
+
+	
+	<!-- ClassLoaderSearch settings -->
+	<CLASS-LOADER-SEARCH>
+		<JAR Bootstrap="true" System="false" must="true">jsentry.jar</JAR>
+	</CLASS-LOADER-SEARCH>
+
+
+	<!-- Essential Java Classes which services as "TOOL", "SWITCH" for Sentry Agent
+	Note: Only .class files are available, .jar is not permitted.
+        The order of loading class is significant by appears order of definition.
+        The maximum entries of class is one hundred.
+	-->
+	<ESSENTIAL-JAVA-CLASSES package="jsentry" home="/home/alex/Spectrum/" >
+		<CLASS must="true" sabi="true" main="true" define-if-possible="true">jvas_swi</CLASS>
+		<CLASS must="true" sabi="false" main="false" define-if-possible="true">jvas_swi$jvas_init</CLASS>
+		<CLASS must="true" sabi="false" main="false" define-if-possible="true">sabi</CLASS>
+		<CLASS must="true" sabi="false" main="false" define-if-possible="true">jvas_vtrace</CLASS>
+		<xCLASS must="true" sabi="false" main="false" define-if-possible="true">jvas_vtapi_stub</xCLASS>
+	</ESSENTIAL-JAVA-CLASSES>
+
+
+	<!-- Home directory of config files of Class-Transformation-Definition -->
+	<CLASS-TRANSFORM preload="true" delay="5000" define-home="conf/tc/"></CLASS-TRANSFORM>
+
+
+	<!-- Regarding to vTrace configures -->
+	<VTRACE>
+	</VTRACE>
+
+
+	<!-- Regarding to running-parameters, behavior-settings, etc. -->
+	<RUN>
+		<!-- Does the Sentry is a nontrivial agent style
+			YES/TRUE: it is a nontrivial agent
+			NO/FALSE: it is a trivial agent, must loaded by JVM
+			AUTO    : determined by self according to the JVM PHASE
+			Note: Deprecated. Leaves it only AUTO if possible.
+		-->
+		<NONTRIVIAL-AGENT>auto</NONTRIVIAL-AGENT>
+
+		<!-- refer to SABI-Specification
+			Mode Identifier: TRACE, PREVENT, OFG, DFG, IAST
+      Attributes:
+			distribute:
+			independent: 
+			silent:
+			quiet:
+			auto:
+		 -->
+		<MODE independent="false" silent="false" quiet="true" auto="true">IAST,</MODE>
+
+		<!-- Capacities -->
+		<CAPACITY>
+		</CAPACITY>
+
+		<!-- Journal Setting 
+		mask: INFO(1), WARN(2), ERROR(4), DEBUG(8), EVENT(16), CRIT(32), MT(64), ALL
+		-->
+		<JOURNAL path="" fifo="true" mask="0x1f"></JOURNAL>
+
+
+		<JAVA>
+			<ClassPath></ClassPath>
+			<LibraryPath>/usr/local/lib/</LibraryPath>
+		</JAVA>
+
+		<SENTRY-LIBPATH>
+			<JVAS>/usr/local/lib/libSentry.so</JVAS>
+
+			<JVAS-SWI>/usr/local/lib/libSentry.so</JVAS-SWI>
+		</SENTRY-LIBPATH>
+
+	</RUN>
+
+
+  <MASTER-LIST> 
+    <MASTER en="1" acc="admin" name="LOCAL">
+      <NODE alias="SELF" ID="0001" IP="127.0.0.1" PORT="8800"></NODE>
+    </MASTER>
+	</MASTER-LIST>
+
+</JVAS>

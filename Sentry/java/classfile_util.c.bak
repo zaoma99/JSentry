@@ -1,0 +1,1631 @@
+/* ==============================================================================================================
+ * Author: CXX
+ * Date: 2022-04-14
+ * Version:
+ * Copyright (C) CXX, All rights reserved
+ * Description:
+ * History:
+ * 20220414: C source file, be created
+ * ==============================================================================================================
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "classfile_util.h"
+#include "cf_impl.h"
+
+#include "common/error_user.h"
+
+#ifdef CF_MEMPOOL
+#include "advLib/usrMMU.h"
+#endif
+
+#pragma GCC diagnostic ignored "-Wunused-value"
+
+
+
+//
+CF_HIDDEN void* cf_malloc( int sys_mmp, long *mmp, size_t size )
+{
+	if( sys_mmp )
+	{
+		void *ptr = malloc( size + sizeof(struct _cf_mbnode_t) );
+		if( !ptr )
+			return NULL;
+
+		struct _cf_mbnode_t *nd = (struct _cf_mbnode_t*)ptr;
+		nd->next = NULL;
+		nd->prior = (void*)*mmp;
+
+		if( *mmp )
+			((struct _cf_mbnode_t*)*mmp)->next = ptr;
+
+		*mmp = (long)ptr;  // always pointer to the tail
+
+		return ptr+sizeof(struct _cf_mbnode_t);
+	}
+
+#ifndef CF_MEMPOOL
+	errno = errNotSupport;
+	return NULL;
+#else
+	return (void*)UM_Alloc( *(UM_ID*)mmp, size );
+#endif
+}
+
+//
+CF_HIDDEN void cf_free( int sys_mmp, long *mmp, void *ptr )
+{
+	if( sys_mmp )
+	{
+		struct _cf_mbnode_t *_nd = (struct _cf_mbnode_t*)*mmp;
+		struct _cf_mbnode_t *nd = (struct _cf_mbnode_t*)(ptr - sizeof(struct _cf_mbnode_t));
+
+		// check node
+		while( _nd && _nd != nd ) _nd = _nd->prior;
+
+		if( _nd )
+		{
+			if( nd->prior )
+				nd->prior->next = nd->next;
+			else
+				*mmp = (long)nd->next;
+
+			if( nd->next )
+				nd->next->prior = nd->prior;
+
+			free( nd );
+		}
+		else
+			_ERROR_PUT_( "invalid pointer" );
+	}
+	else
+	{
+#ifndef CF_MEMPOOL
+		errno = errNotSupport;
+#else
+		UM_Free( (UM_ID)mmp, ptr );
+#endif
+	}
+}
+
+
+//
+CF_HIDDEN void cf_destroy_mempool( long *mmp )
+{
+	struct _cf_mbnode_t *nd2, *nd = (struct _cf_mbnode_t*)*mmp;
+	while( nd )
+	{
+		nd2 = nd->prior;
+		free( nd );
+		nd = nd2;
+	}
+	*mmp = 0;
+}
+
+
+//
+CF_HIDDEN int cf_create_mempool( int sys_mmp, long *mmphd )
+{
+	if( sys_mmp )
+	{
+		if( *mmphd )
+			cf_destroy_mempool( mmphd );
+		return 0;
+	}
+
+#ifdef CF_MEMPOOL
+	// prepare MEMPOOL
+	UM_ID hd = *mmphd;
+
+	if( hd != -1 && hd != 0 )
+	{
+		if( UM_CheckPool(hd) != 0 )  // test existing of MEMPOOL
+		{
+			// invalid MEMPOOL
+			if( errno == ESRCH )
+				hd = -1;
+			else
+				return -1;  // undefined
+		}
+		else
+		{
+			// always delete
+			UM_DeletePool( hd );
+			hd = -1;
+		}
+	}
+
+	if( hd == 0 || hd == -1 )
+	{
+		// create a new MEMPOOL
+		*mmphd = hd = UM_CreatePoolEx2( 16, FALSE, FALSE, _MEMPOOL_INCSIZE );
+		if( hd == -1 || hd == 0 )
+			return -1;
+	}
+	return 0;
+#else
+	errno = errNotSupport;
+	return -1;
+#endif
+}
+
+
+
+// ========================================================================================================================================
+// Global Variables
+// ========================================================================================================================================
+
+// Defined Constant Pool Item Name( MUST be ordered with JVM_CONSTANT_xxx )
+const char CF_CP_NAME[32][32] = {
+		"",
+	    "Utf8",
+	    "Unicode",
+	    "Integer",
+	    "Float",
+	    "Long",
+	    "Double",
+	    "Class",
+	    "String",
+	    "Fieldref",
+	    "Methodref",
+	    "InterfaceMethodref",
+	    "NameAndType",
+		"Unknown13",
+		"Unknown14",
+	    "MethodHandle",
+	    "MethodType",
+		"Dynamic",
+	    "InvokeDynamic",
+		"Module",
+		"Package"
+};
+
+// Defined Dynamic Reference Kind
+const char CF_DYNREF_KIND_NAME[32][24] = {
+		"",
+		"getField",
+		"getStatic",
+		"putField",
+		"putStatic",
+		"invokeVirtual",
+		"invokeStatic",
+		"invokeSpecial",
+		"newInvokeSpecial",
+		"invokeInterface"
+};
+
+
+//
+const int CF_CPITEM_LEN[32] = _CP_ITEM_LEN;
+
+
+
+// ========================================================================================================================================
+// Local Functions
+// ========================================================================================================================================
+CF_HIDDEN int cf_chk_cpitem( CP_Info *cpi, ssize_t len, int *units, int local_endian )
+{
+	switch( cpi->tag )
+	{
+    case JVM_CONSTANT_Utf8:{
+    	int n;
+    	if( (n=len - sizeof(CP_Utf8)) < 0 )
+    		return n;
+    	n = ((CP_Utf8*)cpi)->len;
+    	n = sizeof(CP_Utf8) + _CF_ENDIAN_FLIP_16(n);
+    	if( (len -= n) < 0 )
+    		return len;
+    	*units = 1;
+
+#ifdef _ARCH_ENDIAN_LITTLE
+    	//if( local_endian & CF_MAP_LOCAL_ENDIAN_VALUE )
+    		_CF_ENDIAN_SWAP_U2( ((CP_Utf8*)cpi)->len  );
+#endif
+    	return n;
+    }
+
+    case JVM_CONSTANT_Integer:
+    case JVM_CONSTANT_Float:    // CP_Float as same as CP_Integer
+    	if( (len -= sizeof(CP_Integer)) < 0 )
+			return len;
+    	*units = 1;
+
+#ifdef _ARCH_ENDIAN_LITTLE
+    	//if( local_endian & CF_MAP_LOCAL_ENDIAN_VALUE )
+    	{
+    		register int i32=((CP_Integer*)cpi)->i32;
+    		((CP_Integer*)cpi)->i32 = _CF_ENDIAN_FLIP_32( i32 );
+    	}
+#endif
+    	return sizeof(CP_Integer);
+
+    //case JVM_CONSTANT_Float:
+
+    case JVM_CONSTANT_Long:
+    case JVM_CONSTANT_Double:    // CP_Double as same as CP_Long
+    	if( (len -= sizeof(CP_Long)) < 0 )
+			return len;
+    	*units = 2;
+
+#ifdef _ARCH_ENDIAN_LITTLE
+    	//if( local_endian & CF_MAP_LOCAL_ENDIAN_VALUE )
+    	{
+    		register long long i64=((CP_Long*)cpi)->i64;
+    		((CP_Long*)cpi)->i64 = _CF_ENDIAN_FLIP_64( i64 );
+    	}
+#endif
+    	return sizeof(CP_Long);
+
+    //case JVM_CONSTANT_Double:
+
+    case JVM_CONSTANT_Class:
+    	if( (len -= sizeof(CP_Class)) < 0 )
+			return len;
+    	*units = 1;
+
+#ifdef _ARCH_ENDIAN_LITTLE
+    	//if( local_endian & CF_MAP_LOCAL_ENDIAN_INDEX )
+    		_CF_ENDIAN_SWAP_INDEX( ((CP_Class*)cpi)->name_idx  );
+#endif
+    	return sizeof(CP_Class);
+
+    case JVM_CONSTANT_String:
+    	if( (len -= sizeof(CP_String)) < 0 )
+			return len;
+    	*units = 1;
+
+#ifdef _ARCH_ENDIAN_LITTLE
+    	//if( local_endian & CF_MAP_LOCAL_ENDIAN_INDEX )
+    		_CF_ENDIAN_SWAP_INDEX( ((CP_String*)cpi)->str_idx  );
+#endif
+    	return sizeof(CP_String);
+
+    case JVM_CONSTANT_Fieldref:
+    	if( (len -= sizeof(CP_Fieldref)) < 0 )
+			return len;
+    	*units = 1;
+
+#ifdef _ARCH_ENDIAN_LITTLE
+    	//if( local_endian & CF_MAP_LOCAL_ENDIAN_INDEX )
+    	{
+    		_CF_ENDIAN_SWAP_INDEX( ((CP_Fieldref*)cpi)->name_idx  );
+    		_CF_ENDIAN_SWAP_INDEX( ((CP_Fieldref*)cpi)->desc_idx  );
+    	}
+#endif
+    	return sizeof(CP_Fieldref);
+
+    case JVM_CONSTANT_Methodref:
+    	if( (len -= sizeof(CP_Methodref)) < 0 )
+			return len;
+    	*units = 1;
+
+#ifdef _ARCH_ENDIAN_LITTLE
+    	//if( local_endian & CF_MAP_LOCAL_ENDIAN_INDEX )
+    	{
+    		_CF_ENDIAN_SWAP_INDEX( ((CP_Methodref*)cpi)->name_idx  );
+    		_CF_ENDIAN_SWAP_INDEX( ((CP_Methodref*)cpi)->desc_idx  );
+    	}
+#endif
+    	return sizeof(CP_Methodref);
+
+    case JVM_CONSTANT_InterfaceMethodref:
+    	if( (len -= sizeof(CP_InterfaceMethodref)) < 0 )
+			return len;
+    	*units = 1;
+
+#ifdef _ARCH_ENDIAN_LITTLE
+    	//if( local_endian & CF_MAP_LOCAL_ENDIAN_INDEX )
+    	{
+    		_CF_ENDIAN_SWAP_INDEX( ((CP_InterfaceMethodref*)cpi)->name_idx  );
+    		_CF_ENDIAN_SWAP_INDEX( ((CP_InterfaceMethodref*)cpi)->desc_idx  );
+    	}
+#endif
+    	return sizeof(CP_InterfaceMethodref);
+
+    case JVM_CONSTANT_NameAndType:
+    	if( (len -= sizeof(CP_NameAndType)) < 0 )
+			return len;
+    	*units = 1;
+
+#ifdef _ARCH_ENDIAN_LITTLE
+    	//if( local_endian & CF_MAP_LOCAL_ENDIAN_INDEX )
+    	{
+    		_CF_ENDIAN_SWAP_INDEX( ((CP_NameAndType*)cpi)->name_idx  );
+    		_CF_ENDIAN_SWAP_INDEX( ((CP_NameAndType*)cpi)->desc_idx  );
+    	}
+#endif
+    	return sizeof(CP_NameAndType);
+
+    case JVM_CONSTANT_MethodHandle:
+    	if( (len -= sizeof(CP_MethodHandle)) < 0 )
+			return len;
+    	*units = 1;
+
+#ifdef _ARCH_ENDIAN_LITTLE
+    	//if( local_endian & CF_MAP_LOCAL_ENDIAN_INDEX )
+    		_CF_ENDIAN_SWAP_INDEX( ((CP_MethodHandle*)cpi)->ref_idx  );
+#endif
+    	return sizeof(CP_MethodHandle);
+
+    case JVM_CONSTANT_MethodType:
+    	if( (len -= sizeof(CP_MethodType)) < 0 )
+			return len;
+    	*units = 1;
+
+#ifdef _ARCH_ENDIAN_LITTLE
+    	//if( local_endian & CF_MAP_LOCAL_ENDIAN_INDEX )
+    		_CF_ENDIAN_SWAP_INDEX( ((CP_MethodType*)cpi)->desc_idx  );
+#endif
+    	return sizeof(CP_MethodType);
+
+    case JVM_CONSTANT_Dynamic:  /* Dynamic */
+    	if( (len -= sizeof(CP_Dynamic)) < 0 )
+			return len;
+    	*units = 1;
+
+#ifdef _ARCH_ENDIAN_LITTLE
+    	//if( local_endian & CF_MAP_LOCAL_ENDIAN_INDEX )
+    	{
+    		_CF_ENDIAN_SWAP_INDEX( ((CP_Dynamic*)cpi)->bootstrap_attr_idx  );
+    		_CF_ENDIAN_SWAP_INDEX( ((CP_Dynamic*)cpi)->name_type_idx  );
+    	}
+#endif
+    	return sizeof(CP_Dynamic);
+
+    case JVM_CONSTANT_InvokeDynamic:
+    	if( (len -= sizeof(CP_InvokeDynamic)) < 0 )
+			return len;
+    	*units = 1;
+
+#ifdef _ARCH_ENDIAN_LITTLE
+    	//if( local_endian & CF_MAP_LOCAL_ENDIAN_INDEX )
+    	{
+    		_CF_ENDIAN_SWAP_INDEX( ((CP_InvokeDynamic*)cpi)->bootstrap_attr_idx  );
+    		_CF_ENDIAN_SWAP_INDEX( ((CP_InvokeDynamic*)cpi)->name_type_idx  );
+    	}
+#endif
+    	return sizeof(CP_InvokeDynamic);
+
+    case JVM_CONSTANT_Module:  /* Module */
+    case JVM_CONSTANT_Package: /* Package, as same as CP_Module */
+    	if( (len -= sizeof(CP_Module)) < 0 )
+			return len;
+    	*units = 1;
+
+#ifdef _ARCH_ENDIAN_LITTLE
+    	//if( local_endian & CF_MAP_LOCAL_ENDIAN_INDEX )
+    		_CF_ENDIAN_SWAP_INDEX( ((CP_Module*)cpi)->name_idx  );
+#endif
+    	return sizeof(CP_Module);
+
+    //case 20:  /* Package */
+
+    default:
+    	return 0;
+	}
+}
+
+
+//
+CF_HIDDEN ssize_t cf_chk_field( CF_FieldInfo *field, ssize_t len, FILE *hfile, int local_endian )
+{
+	ssize_t sz, _len = len;
+	ssize_t fpos_org = -1;
+	CF_FieldInfo fld;
+
+	if( (len-=sizeof(CF_FieldInfo)) < 0 )
+	{
+		// seek in file
+		fpos_org = ftell( hfile );
+
+		if( fread( ((void*)&fld)+_len, -len, 1, hfile ) != 1 || ferror(hfile) )
+			return 0;
+
+		memcpy( &fld, field, _len );
+		field = &fld;
+	}
+
+	if( field->attr_count )  // MUST check it, because it may be zero
+	{
+		sz = cf_chk_attr( field->attr.ite, _CF_ENDIAN_FLIP_COUNT(field->attr_count), len>0?len:0, hfile, local_endian );
+		if( sz == 0 )
+			return 0;
+
+		if( sz < 0 )
+		{
+			if( len > 0 )
+				len = sz;
+			else
+				len += sz;
+		}
+		else
+		{
+			// deduces the "len" is greater or equal to the "sz"
+			len -= sz;
+		}
+		//len += sz * (-(sz > 0) | 1);  WRONG
+	}
+
+	if( fpos_org != -1 )
+		fseek( hfile, fpos_org, SEEK_SET );  // restore file position
+
+	if( len >= 0 )
+	{
+#ifdef _ARCH_ENDIAN_LITTLE
+		_CF_ENDIAN_SWAP_COUNT( field->attr_count );
+		//if( local_endian & CF_MAP_LOCAL_ENDIAN_INDEX )
+		{
+			_CF_ENDIAN_SWAP_COUNT( field->name_idx );
+			_CF_ENDIAN_SWAP_COUNT( field->desc_idx );
+		}
+
+		//if( local_endian & CF_MAP_LOCAL_ENDIAN_VALUE )
+			_CF_ENDIAN_SWAP_ACCES( field->access.flags );
+#endif
+		return _len - len;
+	}
+
+	return len;    // len < 0 ? len : _len - len;
+}
+
+#define cf_chk_method	cf_chk_field
+
+
+//
+CF_HIDDEN CF_UNUSED int cf_append_new_block( CF_ClassFileMap *cf_map, size_t blksize )
+{
+	// Note: DO NOT change the file position arbitrarily;
+	//       and also DO NOT arbitrarily modify the buffer be referred to by the CF_ClassFileMap.auxi.buf;
+
+	IOBUF_T *buf = &cf_map->auxi.buf;
+	void *ptr = cf_malloc( cf_map->auxi.use_sysheap, &cf_map->auxi.mmphd, blksize );
+	if( !ptr )
+		return -1;
+
+	// merge previous remainders and update the buffer
+	ssize_t ln = IOBUF_AVAILABLE( buf );
+	if( ln > 0 )
+		memcpy( ptr, IOBUF_PTR(buf), (buf->num = ln) );
+	else
+		buf->num = 0;
+	buf->addr = ptr;
+	buf->size = blksize;
+	buf->pos = 0;
+
+	return 0;
+}
+
+
+// allocate new buffer and read file block into the it
+CF_HIDDEN int cf_append_new_block2( CF_ClassFileMap *cf_map, size_t blksize )
+{
+	// Note: DO NOT change the file position arbitrarily;
+	//       and also DO NOT arbitrarily modify the buffer be referred to by the CF_ClassFileMap.auxi.buf;
+
+	FILE *hf = cf_map->auxi.hfile;
+
+	if( feof(hf) || ferror(hf) )
+		return -1;
+
+	ssize_t ln;
+	IOBUF_T *buf = &cf_map->auxi.buf;
+	ssize_t alloc_size = cf_map->auxi.filesize - ftell( hf ) + IOBUF_AVAILABLE( buf );
+
+	if( !cf_map->auxi.blksz_abap && alloc_size > blksize )
+		alloc_size = blksize; // choose small one between the blksize and the remained file contents
+
+	if( IOBUF_CAPACITY(buf) < alloc_size )
+	{
+		void *ptr = cf_malloc( cf_map->auxi.use_sysheap, &cf_map->auxi.mmphd, alloc_size );
+		if( !ptr )
+			return -1;
+
+		// merge previous remainders and update the buffer
+		ln = IOBUF_AVAILABLE( buf );
+		if( ln > 0 )
+			memcpy( ptr, IOBUF_PTR(buf), (buf->num = ln) );
+		else
+			buf->num = 0;
+		buf->addr = ptr;
+		buf->size = alloc_size;
+		buf->pos = 0;
+	}
+
+	// read file contents
+	ln = fread( IOBUF_TAIL(buf), 1, IOBUF_CAPACITY(buf), hf );
+	if( ln < 1 || ferror(hf) )
+		return -1;
+
+	IOBUF_ADD( buf, ln );
+
+	return 0;
+}
+
+
+#if 0 // moved to the cf_file2map.c
+//
+static void* cf_load_bytes( ssize_t len, CF_ClassFileMap *cf_map )
+{
+	FILE *hf = cf_map->auxi.hfile;
+	IOBUF_T *buf = &cf_map->auxi.buf;
+	ssize_t blksize = 0;
+	ssize_t ava;
+	void *ptr;
+
+	if( buf->addr )
+	{
+		if( len <= (ava=IOBUF_AVAILABLE( buf )) )
+		{
+			// enough bytes to read, return immediately
+			ptr = IOBUF_PTR( buf );
+			IOBUF_SEEK2( buf, len );
+			return ptr;
+		}
+
+		// not enough bytes to read from buffer
+		if( len > buf->size - buf->pos )
+		{
+			// no capability to hold bytes required
+			// need to append a new block
+			blksize = 1;
+		}
+	}
+	else
+	{
+		// append a new block at first
+		blksize = 1;
+		ava = 0;
+	}
+
+	if( blksize )
+	{
+		// allocate new block with fitting size
+		// and, current buffer will be kept
+		ptr = cf_malloc( cf_map->auxi.use_sysheap, &cf_map->auxi.mmphd, len );
+		if( !ptr )
+			return NULL;
+
+		if( ava > 0 )
+		{
+			memcpy( ptr, IOBUF_PTR(buf), ava );
+			buf->num -= ava;
+		}
+	}
+	else
+		ptr = IOBUF_TAIL( buf );
+
+	// read file contents
+	ssize_t n = fread( ptr+ava, 1, len-ava, hf );
+	if( ferror(hf) || n+ava != len )  // MUST equal to the len
+	{
+		if( blksize )
+			cf_free( cf_map->auxi.use_sysheap, &cf_map->auxi.mmphd, ptr );
+
+		return NULL;
+	}
+
+	return ptr;
+}
+
+// read constants pool from file
+static int cf_load_constants_pool( CF_ClassFileMap *cf_map, cf_count_t cptab_idx )
+{
+	IOBUF_T *buf = &cf_map->auxi.buf;
+	CP_Info **cps = cf_map->cptab[cptab_idx].cps;
+
+	if( !buf->addr )
+		IOBUF_CLEAR( buf );
+
+	int local_endian = (cf_map->auxi.local_endian_value<<1 | cf_map->auxi.local_endian_index) & 0x03;
+
+	juint8 *data;
+	ssize_t pos;
+	ssize_t len;
+	int nn, units;
+	ssize_t addblksize = 0;
+	cf_count_t c = 1;
+	cf_count_t cp_count = cf_map->cptab[cptab_idx].cp_count;
+
+	cps[0] = NULL;
+
+	while( c < cp_count )
+	{
+		if( addblksize > 0 || IOBUF_AVAILABLE(buf) < 3 )
+		{
+			len = IOBUF_CAPACITY( buf );
+			if( len < 16 )  // addblksize
+				len = _MEMPOOL_ALLOC_FIXSIZE;
+
+			if( cf_append_new_block2( cf_map, len ) == -1 )
+				return -1;
+
+			addblksize = 0;
+		}
+
+		data = buf->addr;
+		pos = buf->pos;
+		len = buf->num;
+		while( c < cp_count && pos < len )
+		{
+			if( (nn = cf_chk_cpitem( (CP_Info*)&data[pos], len-pos, &units, local_endian )) == 0 )
+				return -1;  // undefined
+			else if( nn < 0 )
+			{
+				addblksize = -nn;
+				break;  // need to read contents
+			}
+
+			cps[c] = (CP_Info*)&data[pos];
+			pos += nn;
+
+			//if( units == 2 ) cps[c+1] = cps[c];
+			c += units;
+		}
+		buf->pos = pos;
+	}
+
+	return c-1;
+}
+
+
+// read attributes
+static int cf_load_attributes( CF_ClassFileMap *cf_map, CF_AttrInfo **attr, cf_count_t count )
+{
+	IOBUF_T *buf = &cf_map->auxi.buf;
+	if( !buf->addr )
+		IOBUF_CLEAR( buf );
+
+	int local_endian = (cf_map->auxi.local_endian_value<<1 | cf_map->auxi.local_endian_index) & 0x03;
+
+	juint8 *data;
+	ssize_t pos;
+	ssize_t len;
+
+	ssize_t nn;
+	IOBUF_T __buf = { .addr=NULL };
+	ssize_t addblksize = 0;
+	cf_count_t c = 0;
+
+	while( c < count )
+	{
+		if( addblksize > 0 || IOBUF_AVAILABLE(buf) < sizeof(CF_AttrInfo) )
+		{
+			__buf.addr = NULL;
+
+			len = addblksize > 0 ? addblksize : 32;
+			if( (nn = buf->size - buf->pos) >= len )
+			{
+				// directly read file
+				nn = fread( IOBUF_TAIL(buf), 1, IOBUF_CAPACITY(buf), cf_map->auxi.hfile );
+				if( ferror(cf_map->auxi.hfile) || nn < 1 )
+					return -1;
+			}
+			else
+			{
+				// need a new block
+
+				if( nn >= 64 )
+				{
+					// the current buffer will be kept
+					// meanwhile, it means the addblksize is greater than 64
+					// DO NOT change the addblksize
+					__buf = *buf;
+
+					if( cf_append_new_block2( cf_map, addblksize ) == -1 )
+						return -1;
+				}
+				else
+				{
+					// try to allocate a new block
+					// the current buffer will be sealed
+					if( addblksize < _MEMPOOL_ALLOC_FIXSIZE )
+						addblksize = _MEMPOOL_ALLOC_FIXSIZE;
+
+					if( cf_append_new_block2( cf_map, addblksize ) == -1 )
+						return -1;
+				}
+			}
+			addblksize = 0;
+		}
+
+		data = buf->addr;
+		pos = buf->pos;
+		len = buf->num;
+		for( ; c < count && pos < len; ++c )
+		{
+			if( (nn = cf_chk_attr( (CF_AttrInfo*)&data[pos], 1, len-pos, cf_map->auxi.hfile, local_endian )) == 0 )
+				return -1;  // undefined
+			else if( nn < 0 )
+			{
+				addblksize = len - pos - nn;  // whole attribute size
+				break;  // need to read contents
+			}
+
+			attr[c] = (CF_AttrInfo*)&data[pos];
+			pos += nn;
+		}
+
+		if( __buf.addr )
+			*buf = __buf;
+		else
+			buf->pos = pos;
+	}
+
+	return c;
+}
+
+
+// read fields
+static int cf_load_fields( CF_ClassFileMap *cf_map, CF_FieldInfo **fds, ssize_t *fds_len, cf_count_t count )
+{
+	IOBUF_T *buf = &cf_map->auxi.buf;
+	if( !buf->addr )
+		IOBUF_CLEAR( buf );
+
+	int local_endian = (cf_map->auxi.local_endian_value<<1 | cf_map->auxi.local_endian_index) & 0x03;
+
+	juint8 *data;
+	ssize_t pos;
+	ssize_t len;
+
+	ssize_t nn;
+	IOBUF_T __buf = { .addr=NULL };
+	ssize_t addblksize = 0;
+	cf_count_t c = 0;
+
+	while( c < count )
+	{
+		if( addblksize > 0 || IOBUF_AVAILABLE(buf) < sizeof(CF_FieldInfo) )
+		{
+			__buf.addr = NULL;
+
+			len = addblksize > 0 ? addblksize : 32;  // sizeof(CF_FieldInfo) * 4
+			if( (nn = buf->size - buf->pos) >= len )
+			{
+				// directly read file
+				nn = fread( IOBUF_TAIL(buf), 1, IOBUF_CAPACITY(buf), cf_map->auxi.hfile );
+				if( ferror(cf_map->auxi.hfile) || nn < 1 )
+					return -1;
+			}
+			else
+			{
+				// need a new block
+
+				if( nn >= 128 )
+				{
+					// the current buffer will be kept
+					// meanwhile, it means the addblksize is greater than 128
+					// DO NOT change the addblksize
+					__buf = *buf;
+
+					if( cf_append_new_block2( cf_map, addblksize ) == -1 )
+						return -1;
+				}
+				else
+				{
+					// try to allocate a new block
+					// the current buffer will be sealed
+					if( addblksize < _MEMPOOL_ALLOC_FIXSIZE )
+						addblksize = _MEMPOOL_ALLOC_FIXSIZE;
+
+					if( cf_append_new_block2( cf_map, addblksize ) == -1 )
+						return -1;
+				}
+			}
+			addblksize = 0;
+		}
+
+		data = buf->addr;
+		pos = buf->pos;
+		len = buf->num;
+		for( ; c < count && pos < len; ++c )
+		{
+			if( (nn = cf_chk_field( (CF_FieldInfo*)&data[pos], len-pos, cf_map->auxi.hfile, local_endian )) == 0 )
+				return -1;  // undefined
+			else if( nn < 0 )
+			{
+				addblksize = len - pos - nn;  // whole field size
+				break;  // need to read contents
+			}
+
+			fds[c] = (CF_FieldInfo*)&data[pos];
+			fds_len[c] = nn;
+			pos += nn;
+		}
+
+		if( __buf.addr )
+			*buf = __buf;
+		else
+			buf->pos = pos;
+	}
+
+	return c;
+}
+
+#define cf_load_methods		cf_load_fields
+
+//
+static FILE* cf_openfile( const char *classfile, CF_ClassFile *cfhd, ssize_t *filesize )
+{
+	// Note: after succeed to finish the job, the file pointer will be set at the first CP_Info of the file
+
+	FILE *hf;
+
+	hf = fopen( classfile, "rb" );
+	if( hf )
+	{
+		// get file size
+		fseek( hf, 0, SEEK_END );
+		ssize_t fsz = ftell( hf );
+		if( fsz <= sizeof(CF_ClassFile) )
+			goto LAB_EXIT;
+
+		fseek( hf, 0, SEEK_SET );
+
+		// read the head at first, and then check it validation
+		size_t sz;
+		sz = fread( (void*)cfhd, _OFFSET(CF_ClassFile, cps), 1, hf );
+		if( sz != 1 )
+			goto LAB_EXIT;
+
+		// check magic value
+		if( _CF_ENDIAN_SWAP_MAGIC(cfhd->magic) != CF_MAGIC_VALUE )
+			goto LAB_EXIT;
+
+		// check version
+		_CF_ENDIAN_SWAP_U2( cfhd->minor_ver );
+		_CF_ENDIAN_SWAP_U2( cfhd->major_ver );
+
+		// check file size again
+		if( _CF_ENDIAN_SWAP_COUNT(cfhd->cp_count) == 0 ||
+			sizeof(CF_ClassFile) + cfhd->cp_count * sizeof(CP_Info) >= fsz )
+			goto LAB_EXIT;
+
+		*filesize = fsz;
+		return hf;
+
+		LAB_EXIT:
+		fclose( hf );
+	}
+	return NULL;
+}
+
+//
+static ssize_t cf_readfile( void *dst, ssize_t len, CF_ClassFileMap *cf_map )
+{
+	IOBUF_T *buf = &cf_map->auxi.buf;
+	ssize_t ava;
+
+	if( buf->addr )
+	{
+		if( (ava=IOBUF_AVAILABLE( buf )) > 0 )
+		{
+			if( ava > len )
+				ava = len;
+			memcpy( dst, IOBUF_PTR(buf), ava );
+			IOBUF_SEEK2( buf, ava );
+			len -= ava;
+		}
+	}
+	else
+		ava = 0;
+
+	if( len > 0 )
+	{
+		// read file contents
+		ava += fread( dst+ava, 1, len, cf_map->auxi.hfile );
+		if( ferror(cf_map->auxi.hfile) )
+			return -1;
+	}
+
+	return ava;
+}
+
+
+
+// ========================================================================================================================================
+// Functions
+// ========================================================================================================================================
+
+// Function:
+CF_HIDDEN int cf_file2map( const char *classfile, CF_ClassFileMap *cf_map, int format )
+{
+	CF_ClassFile cf;
+	ssize_t sz;
+	FILE *hf = cf_openfile( classfile, &cf, &sz );
+	if( !hf )
+		return -1;
+
+	if( cf_create_mempool( cf_map->auxi.use_sysheap, &cf_map->auxi.mmphd ) == -1 )
+		goto LAB_EXIT;
+
+
+	// clear map
+	memset( cf_map, 0, CF_CLASSFILE_MAP_SIZE );
+	memset( &cf_map->auxi.buf, 0, sizeof(cf_map->auxi.buf) );
+	cf_map->auxi.hfile = hf;
+	cf_map->auxi.filesize = sz;
+
+	//
+	sz = sizeof(void*) * (10 + cf.cp_count + 1);
+	void **vptr = (void**)cf_malloc( cf_map->auxi.use_sysheap, &cf_map->auxi.mmphd, sz );
+	if( !vptr )
+		goto LAB_EXIT2;
+
+	memset( vptr, 0, sz );
+	cf_map->cptab = (struct _cf_cptab_item*)vptr;
+	cf_map->iftab = (struct _cf_iftab_item*)&vptr[2];
+	cf_map->fdtab = (struct _cf_fdtab_item*)&vptr[4];
+	cf_map->mdtab = (struct _cf_mdtab_item*)&vptr[6];
+	cf_map->attrtab = (struct _cf_attrtab_item*)&vptr[8];
+
+	// ======================================================================================================================
+	// to load the Constants Pool
+
+	cf_map->cptab[0].cps = (CP_Info**)&vptr[10];
+	cf_map->cptab[0].cp_count = cf.cp_count;
+	cf_map->cptab_count = 1;
+	if( cf_load_constants_pool( cf_map, 0 ) != cf.cp_count-1 )
+		goto LAB_EXIT2;
+
+
+	// ======================================================================================================================
+	// read the "access", "this_class", "super_class", "interfaces_count"
+	ssize_t len = _OFFSET(CF_ClassFile, ifs) - _OFFSET(CF_ClassFile, access);
+	if( cf_readfile( &cf.access, len, cf_map ) != len )
+		goto LAB_EXIT2;
+
+	_CF_ENDIAN_SWAP_COUNT( cf.if_count );
+
+	// ======================================================================================================================
+	// to load the interfaces
+
+	cf_idx_t *idx = (cf_idx_t*)cf_load_bytes( cf.if_count*sizeof(cf_idx_t)+sizeof(cf_count_t), cf_map );
+	if( !idx )
+		goto LAB_EXIT2;
+
+	cf_map->iftab[0].ifs = cf.if_count > 0 ? idx : NULL;
+	cf_map->iftab[0].if_count = cf.if_count;
+	cf_map->iftab_count = !!cf.if_count;
+
+#ifdef _ARCH_ENDIAN_LITTLE
+	if( cf.if_count > 0 ) // && cf_map->auxi.local_endian_index )
+	{
+		// flip byte order( big => little )
+		cf_count_t c;
+		for( c=0; c < cf.if_count; c++ )
+			_CF_ENDIAN_SWAP_INDEX( idx[c] );
+	}
+#endif
+
+
+	// ======================================================================================================================
+	// ready to load fields
+
+	cf.field_count = idx[cf.if_count];    // the fields_count is saved at the end of the "idx"
+	_CF_ENDIAN_SWAP_COUNT( cf.field_count );
+	if( cf.field_count > 0 )
+	{
+		sz = sizeof(void*) * cf.field_count * 2;  // double size, for store related field length
+		vptr = (void**)cf_malloc( cf_map->auxi.use_sysheap, &cf_map->auxi.mmphd, sz );
+		if( !vptr )
+			goto LAB_EXIT2;
+
+		memset( vptr, 0, sz );
+		cf_map->fdtab[0].fields = (CF_FieldInfo**)vptr;
+		cf_map->fdtab[0].fields_len = (ssize_t*)&vptr[cf.field_count];
+		cf_map->fdtab[0].field_count = cf.field_count;
+		if( cf_load_fields( cf_map, cf_map->fdtab[0].fields, cf_map->fdtab[0].fields_len, cf.field_count ) != cf.field_count )
+			goto LAB_EXIT2;
+	}
+	else
+	{
+		cf_map->fdtab[0].fields = NULL;
+		cf_map->fdtab[0].field_count = 0;
+	}
+	cf_map->fdtab_count = !!cf.field_count;
+
+
+	// ======================================================================================================================
+	// ready to load methods
+
+	if( cf_readfile( &cf.method_count, sizeof(cf_count_t), cf_map ) != sizeof(cf_count_t) )  // read the methods_count
+		goto LAB_EXIT2;
+
+	_CF_ENDIAN_SWAP_COUNT( cf.method_count );
+	if( cf.method_count > 0 )
+	{
+		sz = sizeof(void*) * cf.method_count * 2;  // double size, for store related method length
+		vptr = (void**)cf_malloc( cf_map->auxi.use_sysheap, &cf_map->auxi.mmphd, sz );
+		if( !vptr )
+			goto LAB_EXIT2;
+
+		memset( vptr, 0, sz );
+		cf_map->mdtab[0].methods = (CF_MethodInfo**)vptr;
+		cf_map->mdtab[0].methods_len = (ssize_t*)&vptr[cf.method_count];
+		cf_map->mdtab[0].method_count = cf.method_count;
+		if( cf_load_methods( cf_map, cf_map->mdtab[0].methods, cf_map->mdtab[0].methods_len, cf.method_count ) != cf.method_count )
+			goto LAB_EXIT2;
+	}
+	else
+	{
+		cf_map->mdtab[0].methods = NULL;
+		cf_map->mdtab[0].method_count = 0;
+	}
+	cf_map->mdtab_count = !!cf.method_count;
+
+
+	// ======================================================================================================================
+	// ready to load attributes
+
+	if( cf_readfile( &cf.attr_count, sizeof(cf_count_t), cf_map ) != sizeof(cf_count_t) )  // read the attributes_count
+		goto LAB_EXIT2;
+
+	_CF_ENDIAN_SWAP_COUNT( cf.attr_count );
+	if( cf.attr_count > 0 )
+	{
+		sz = sizeof(void*) * cf.attr_count;
+		vptr = (void**)cf_malloc( cf_map->auxi.use_sysheap, &cf_map->auxi.mmphd, sz );
+		if( !vptr )
+			goto LAB_EXIT2;
+
+		memset( vptr, 0, sz );
+		cf_map->attrtab[0].attr = (CF_AttrInfo**)vptr;
+		cf_map->attrtab[0].attr_count = cf.attr_count;
+		if( cf_load_attributes( cf_map, (CF_AttrInfo**)vptr, cf.attr_count ) != cf.attr_count )
+			goto LAB_EXIT2;
+	}
+	else
+	{
+		cf_map->attrtab[0].attr = NULL;
+		cf_map->attrtab[0].attr_count = 0;
+	}
+	cf_map->attrtab_count = !!cf.attr_count;
+
+
+	// ======================================================================================================================
+	// finished
+	cf_map->magic = cf.magic;
+	cf_map->minor_ver = cf.minor_ver;
+	cf_map->major_ver = cf.major_ver;
+
+#ifdef _ARCH_ENDIAN_LITTLE
+	if( 1 ) // cf_map->auxi.local_endian_value )
+		cf_map->access.flags = _CF_ENDIAN_FLIP_ACCES( cf.access.flags );
+	else
+#endif
+		cf_map->access = cf.access;
+
+#ifdef _ARCH_ENDIAN_LITTLE
+	if( 1 ) // cf_map->auxi.local_endian_index )
+	{
+		cf_map->this_class = _CF_ENDIAN_FLIP_INDEX( cf.this_class );
+		cf_map->super_class = _CF_ENDIAN_FLIP_INDEX( cf.super_class );
+	}
+	else
+#endif
+	{
+		cf_map->this_class = cf.this_class;
+		cf_map->super_class = cf.super_class;
+	}
+
+	return 0;
+
+
+	LAB_EXIT2:
+#ifdef CF_MEMPOOL
+	UM_DeletePool( cf_map->auxi.mmphd );
+#else
+#endif
+	cf_map->auxi.mmphd = 0;
+	memset( &cf_map->auxi.buf, 0, sizeof(cf_map->auxi.buf) );
+
+
+	LAB_EXIT:
+	fclose( hf );
+	cf_map->auxi.hfile = NULL;
+
+	return -1;
+}
+#endif
+
+
+// Function:
+CF_HIDDEN void cf_free_map( CF_ClassFileMap *cf_map )
+{
+	if( cf_map->auxi.mmphd )
+	{
+		if( cf_map->auxi.use_sysheap )
+			cf_destroy_mempool( &cf_map->auxi.mmphd );
+#ifdef CF_MEMPOOL
+		else
+			UM_DeletePool( cf_map->auxi.mmphd );
+#endif
+	}
+
+	if( cf_map->auxi.hfile )
+		fclose( cf_map->auxi.hfile );
+
+	memset( (void*)cf_map, 0, sizeof(CF_ClassFileMap) );
+}
+
+// Function:
+int cf_make_map( CF_MAPHD hmap, const char *classfile )
+{
+	CF_ClassFileMap *map = cf_handle2stru( hmap );
+	if( map )
+		return cf_file2map( classfile, map, 0 );
+
+	errno = EINVAL;
+	return -1;
+}
+
+
+// Function:
+CF_MAPHD cf_create_map( int map_flags )
+{
+	CF_ClassFileMap *map = malloc( sizeof(CF_ClassFileMap) );
+	if( map )
+	{
+		memset( map, 0, sizeof(CF_ClassFileMap) );
+		map->auxi.flag = map_flags & CF_MAP_FLAG_MASK;
+
+		map->auxi.flag |= CF_MAP_LOCAL_ENDIAN_INDEX | CF_MAP_LOCAL_ENDIAN_VALUE;  // ALWAYS
+
+		CF_MAP_SET_IDENT( map->auxi.ident );
+
+		return CF_MAP_STRU2HANDLE( map );  // (CF_MAPHD)&map->auxi.ident;
+	}
+
+	return NULL;
+}
+
+// Function:
+void cf_destroy_map( CF_MAPHD *hmap )
+{
+	if( hmap )
+	{
+		CF_ClassFileMap *map = cf_handle2stru( *hmap );
+		if( map )
+		{
+			cf_free_map( map );
+			free( map );
+			*hmap = NULL;
+		}
+	}
+}
+
+
+// ========================================================================================================================================
+// Exported Functions: Class File Map Operator
+// ========================================================================================================================================
+
+// Function: copy utf8 string
+// Note: temporary process, need to be enhanced
+int cf_copy_utf8( const CP_Utf8 *cp, char *dst, int len )
+{
+	if( cp->tag == JVM_CONSTANT_Utf8 )
+	{
+		if( len > cp->len )
+			len = cp->len;
+		else
+			len--;
+		if( len >= 0 )
+		{
+			memcpy( dst, cp->b, len );
+			dst[len] = 0;
+		}
+		return len;
+	}
+	return -1;
+}
+
+
+// Function: find constants pool item which tag is Utf8, and also it's contents completely matches the specified value
+CF_HIDDEN const CP_Utf8* cf_get_cpitem_utf8( const CF_ClassFileMap *cf_map, const char *utf8, int len, cf_idx_t *idx )
+{
+	if( utf8 && len > 0 )
+	{
+		const CP_Utf8 **cps;
+		cf_count_t c, n, m, i;
+
+		i = 0;
+		for( c=0; c < cf_map->cptab_count; c++ )
+		{
+			cps = (const CP_Utf8**)cf_map->cptab[c].cps;
+			m = cf_map->cptab[c].cp_count;
+
+			for( n=1; n < m; n++ )  // cause: start from 1
+			{
+				if( cps[n]->tag == JVM_CONSTANT_Utf8 &&
+					cps[n]->len == len &&
+					strncmp(cps[n]->b, utf8, len)	/* case sensitive */
+					)
+				{
+					if( idx )
+						*idx = i + n;
+
+					return cps[n];
+				}
+			}
+			i += m;
+		}
+	}
+	return NULL;
+}
+
+
+// Function: get constants pool according to the index
+CF_HIDDEN const CP_Info* cf_get_cpitem( const CF_ClassFileMap *cf_map, cf_idx_t idx )
+{
+	cf_count_t c;
+	for( c=0; c < cf_map->cptab_count; c++ )
+	{
+		if( cf_map->cptab[c].cp_count > idx )
+		{
+			return cf_map->cptab[c].cps[idx];
+		}
+		else
+		{
+			idx -= cf_map->cptab[c].cp_count;
+			idx += !idx;  // 0 => 1
+		}
+	}
+	return NULL;
+}
+
+
+// Function: API formal of the corresponding function "cf_get_cpitem"
+// Return: greater than 0, means completely successful;
+//         equal to 0, if an error occurred, check the errno for further information;
+//         less 0, negative number, means the destination buffer "dst" is not enough to contains constant,
+//         and it's absolute value represents the real size of constant.
+int cf_copy_cpitem( CF_MAPHD hmap, cf_idx_t idx, juint8 *dst, int size )
+{
+	CF_ClassFileMap *map;
+
+	if( !(map = cf_handle2stru( hmap )) )
+	{
+		errno = EINVAL;
+		return 0;
+	}
+
+	const CP_Info *cpi = cf_get_cpitem( map, idx );
+	if( !cpi )
+	{
+		errno = EEXIST;
+		return 0;
+	}
+
+	int len = cpi->tag == JVM_CONSTANT_Utf8 ? ((CP_Utf8*)cpi)->len + sizeof(CP_Utf8) : CF_CPITEM_LEN[cpi->tag];
+	if( len > size )
+		return -len;
+
+	memcpy( dst, cpi, len );
+	return len;
+}
+
+
+// Function: get field or method by specified name_index and/or descriptor_index
+CF_HIDDEN const CF_FieldInfo* cf_get_field_method( int which, const CF_ClassFileMap *cf_map,
+												   cf_idx_t name_idx, cf_idx_t desc_idx,
+												   cf_idx_t *field_idx, ssize_t *field_size )
+{
+	if( name_idx | desc_idx )
+	{
+		CF_FieldInfo **fields;
+		cf_count_t c, n, m, i;
+
+		cf_count_t tablen = which == 1 ? cf_map->fdtab_count : cf_map->mdtab_count;
+		const struct _cf_fdtab_item *tab = which == 1 ? cf_map->fdtab : (struct _cf_fdtab_item*)cf_map->mdtab;
+
+		i = 0;
+		for( c=0; c < tablen; c++ )
+		{
+			fields = tab[c].fields;
+			m = tab[c].field_count;
+			for( n=0; n < m; n++ )
+			{
+				//if( (name_idx == 0 || fields[n]->name_idx == name_idx) && (desc_idx == 0 || fields[n]->desc_idx == desc_idx) )
+				if( !((name_idx & (fields[n]->name_idx ^ name_idx)) | (desc_idx & (fields[n]->desc_idx ^ desc_idx))) )
+				{
+					if( field_idx )
+						*field_idx = i + n;
+
+					if( field_size )
+						*field_size = tab[c].fields_len[n];
+
+					return fields[n];
+				}
+			}
+			i += m;
+		}
+	}
+	return NULL;
+}
+
+
+// Function: find field by specified name and/or descriptor
+CF_HIDDEN const CF_FieldInfo* cf_get_field2( const CF_ClassFileMap *cf_map, const char *name, const char *desc,
+											 cf_idx_t *field_idx, ssize_t *field_len )
+{
+	cf_idx_t name_idx=0, desc_idx=0;
+
+	if( name && !cf_get_cpitem_utf8( cf_map, name, strlen(name), &name_idx) )
+		return NULL;
+	if( desc && !cf_get_cpitem_utf8( cf_map, desc, strlen(desc), &desc_idx) )
+		return NULL;
+
+	return cf_get_field_method( 1, cf_map, name_idx, desc_idx, field_idx, field_len );
+}
+
+
+// Function: get field according to the index
+CF_HIDDEN const CF_FieldInfo* cf_get_field3( const CF_ClassFileMap *cf_map, cf_idx_t idx, ssize_t *field_len )
+{
+	cf_count_t c;
+	for( c=0; c < cf_map->fdtab_count; c++ )
+	{
+		if( cf_map->fdtab[c].field_count > idx )
+		{
+			if( field_len )
+				*field_len = cf_map->fdtab[c].fields_len[idx];
+
+			return cf_map->fdtab[c].fields[idx];
+		}
+		else
+		{
+			idx -= cf_map->fdtab[c].field_count;
+		}
+	}
+	return NULL;
+}
+
+
+
+// Function: find method by specified name and/or descriptor
+CF_HIDDEN const CF_MethodInfo* cf_get_method2( const CF_ClassFileMap *cf_map, const char *name, const char *desc,
+											   cf_idx_t *method_idx, ssize_t *method_len )
+{
+	cf_idx_t name_idx=0, desc_idx=0;
+
+	if( name && !cf_get_cpitem_utf8( cf_map, name, strlen(name), &name_idx) )
+		return NULL;
+	if( desc && !cf_get_cpitem_utf8( cf_map, desc, strlen(desc), &desc_idx) )
+		return NULL;
+
+	return cf_get_field_method( 2, cf_map, name_idx, desc_idx, method_idx, method_len );
+}
+
+
+// Function: get method according to the index
+CF_HIDDEN const CF_MethodInfo* cf_get_method3( const CF_ClassFileMap *cf_map, cf_idx_t idx, ssize_t *method_len )
+{
+	cf_count_t c;
+	for( c=0; c < cf_map->mdtab_count; c++ )
+	{
+		if( cf_map->mdtab[c].method_count > idx )
+		{
+			if( method_len )
+				*method_len = cf_map->mdtab[c].methods_len[idx];
+
+			return cf_map->mdtab[c].methods[idx];
+		}
+		else
+		{
+			idx -= cf_map->mdtab[c].method_count;
+		}
+	}
+	return NULL;
+}
+
+
+// Function: API formal of the corresponding function "cf_copy_field_method"
+// Return: greater than 0, means completely successful;
+//         equal to 0, if an error occurred, check the errno for further information;
+//         less 0, negative number, means the destination buffer "dst" is not enough to contains constant,
+//         and it's absolute value represents the real size of constant.
+ssize_t cf_copy_field_method( int which, CF_MAPHD hmap, juint8 *dst, ssize_t size, cf_idx_t name_idx, cf_idx_t desc_idx, cf_idx_t *result_idx )
+{
+	CF_ClassFileMap *map;
+
+	if( !(map = cf_handle2stru( hmap )) )
+	{
+		errno = EINVAL;
+		return -1;
+	}
+
+	cf_idx_t idx;
+	ssize_t len;
+	const CF_FieldInfo *field = cf_get_field_method( which, map, name_idx, desc_idx, &idx, &len );
+	if( !field )
+	{
+		errno = EEXIST;
+		return -1;
+	}
+
+	if( result_idx )
+		*result_idx = idx;
+
+	if( len > size )
+		return -len;
+
+	memcpy( dst, field, len );
+	return len;
+}
+
+
+// Function: API formal of the corresponding function "cf_copy_field2" and "cf_copy_method2"
+// Return: greater than 0, means completely successful;
+//         equal to 0, if an error occurred, check the errno for further information;
+//         less 0, negative number, means the destination buffer "dst" is not enough to contains constant,
+//         and it's absolute value represents the real size of constant.
+ssize_t cf_copy_field_method_2( int which, CF_MAPHD hmap, juint8 *dst, ssize_t size, const char *name, const char *desc, cf_idx_t *result_idx )
+{
+	CF_ClassFileMap *map;
+
+	if( !(map = cf_handle2stru( hmap )) )
+	{
+		errno = EINVAL;
+		return -1;
+	}
+
+	cf_idx_t idx;
+	ssize_t len;
+	const CF_FieldInfo *field = which == 1 ? cf_get_field2( map, name, desc, &idx, &len )
+										   : (const CF_FieldInfo*)cf_get_method2( map, name, desc, &idx, &len );
+	if( !field )
+	{
+		errno = EEXIST;
+		return -1;
+	}
+
+	if( result_idx )
+		*result_idx = idx;
+
+	if( len > size )
+		return -len;
+
+	memcpy( dst, field, len );
+	return len;
+}
+
+// Function: API formal of the corresponding function "cf_copy_field3" and "cf_copy_method3"
+// Return: greater than 0, means completely successful;
+//         equal to 0, if an error occurred, check the errno for further information;
+//         less 0, negative number, means the destination buffer "dst" is not enough to contains constant,
+//         and it's absolute value represents the real size of constant.
+ssize_t cf_copy_field_method_3( int which, CF_MAPHD hmap, juint8 *dst, ssize_t size, cf_idx_t index )
+{
+	CF_ClassFileMap *map;
+
+	if( !(map = cf_handle2stru( hmap )) )
+	{
+		errno = EINVAL;
+		return -1;
+	}
+
+	ssize_t len;
+	const CF_FieldInfo *field = which == 1 ? cf_get_field3( map, index, &len )
+										   : (const CF_FieldInfo*)cf_get_method3( map, index, &len );
+	if( !field )
+	{
+		errno = EEXIST;
+		return -1;
+	}
+
+	if( len > size )
+		return -len;
+
+	memcpy( dst, field, len );
+	return len;
+}
+
+
+// Function:
+CF_HIDDEN void cf_print_map_ex( const CF_ClassFileMap *map, FILE *hfile )
+{
+	fprintf( hfile,
+			"magic: %X\n"
+			"minor_version: %d\n"
+			"major_version: %d\n"
+			"constant_pool_count: %d\n"
+			"access_flags: %04X\n{",
+			map->magic, map->minor_ver, map->major_ver, map->cptab[0].cp_count, map->access.flags );
+
+	cf_print_access( map->access, hfile );
+
+	CP_InfoConstPtr cp0, cp1;
+	cf_count_t c;
+	char name[512];
+	int n, ifsum, fdsum, mdsum, attrsum;
+
+	name[n=0] = 0;
+	if( (cp0.Info = cf_get_cpitem( map, map->this_class )) )
+	{
+		if( (cp0.Info = cf_get_cpitem( map, cp0.Class->name_idx )) )
+			n = cf_copy_utf8( cp0.Utf8, name, sizeof(name)-100 );
+	}
+
+	name[n += 2] = 0;
+	if( (cp1.Info = cf_get_cpitem( map, map->super_class )) )
+	{
+		if( (cp1.Info = cf_get_cpitem( map, cp1.Class->name_idx )) )
+			cf_copy_utf8( cp1.Utf8, name+n, sizeof(name) - n );
+	}
+
+	for( ifsum=0, c=0; c < map->iftab_count; c++ )
+		ifsum += map->iftab[c].if_count;
+
+	for( fdsum=0, c=0; c < map->fdtab_count; c++ )
+		fdsum += map->fdtab[c].field_count;
+
+	for( mdsum=0, c=0; c < map->mdtab_count; c++ )
+		mdsum += map->mdtab[c].method_count;
+
+	for( attrsum=0, c=0; c < map->attrtab_count; c++ )
+		attrsum += map->attrtab[c].attr_count;
+
+	fprintf( hfile, "}\n"
+			"this_class: %d, %s\n"
+			"super_class: %d, %s\n"
+			"interfaces_count: %d\n"
+			"fields_count: %d\n"
+			"methods_count: %d\n"
+			"attributes_count: %d\n",
+			map->this_class, name, map->super_class, name+n,
+			ifsum, fdsum, mdsum, attrsum );
+
+	cf_print_cptab( map, hfile );
+
+	for( c=0; c < map->iftab_count; c++ )
+		cf_print_interface( map->iftab[c].ifs, map->iftab[c].if_count, map, hfile );;
+
+	for( c=0; c < map->fdtab_count; c++ )
+		cf_print_fieldinfo( (const CF_FieldInfo **)map->fdtab[c].fields, map->fdtab[c].field_count, map, hfile );
+
+	for( c=0; c < map->mdtab_count; c++ )
+		cf_print_methodinfo( (const CF_MethodInfo **)map->mdtab[c].methods, map->mdtab[c].method_count, map, hfile );
+
+	cf_print_attrtab( map, hfile );
+}
+
+
+// Function: API formal of the corresponding function "cf_print_map_ex"
+void cf_print_map( CF_MAPHD hmap, FILE *hfile )
+{
+	if( hfile )
+	{
+		CF_ClassFileMap *map = cf_handle2stru( hmap );
+		if( map )
+			cf_print_map_ex( map, hfile );
+	}
+}
+
+
+
+
+
+
+//
+void cf_test( const char *fn )
+{
+	UM_Initiate();
+
+	CF_ClassFileMap cf_map = {0};
+	CF_MAP_SET_FALG( cf_map, blksz_abap, 1 );
+	CF_MAP_SET_FALG( cf_map, use_sysheap, 1 );
+	CF_MAP_LOCAL_ENDIAN_IDX( cf_map );
+	CF_MAP_LOCAL_ENDIAN_VAL( cf_map );
+
+	cf_file2map( fn, &cf_map, 0 );
+
+	cf_print_map_ex( &cf_map, stdout );
+
+	cf_free_map( &cf_map );
+
+	UM_Release();
+}
